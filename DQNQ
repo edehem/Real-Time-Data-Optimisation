@@ -1,0 +1,265 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+from collections import deque
+import time
+import psutil
+import os
+import csv
+
+# Replay Buffer Class
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def add(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (np.array(states), np.array(actions), np.array(rewards),
+                np.array(next_states), np.array(dones))
+
+    def __len__(self):
+        return len(self.buffer)
+
+# Encoder Class (for preprocessing state input)
+class Encoder(nn.Module):
+    def __init__(self, input_size, encoded_size):
+        super(Encoder, self).__init__()
+        self.fc1 = nn.Linear(input_size, 64)
+        self.fc2 = nn.Linear(64, encoded_size)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return torch.relu(self.fc2(x))
+
+# DQN Model
+class DQN(nn.Module):
+    def __init__(self, encoded_size, action_size):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(encoded_size, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, action_size)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+# Vehicle Production Environment
+class VehicleEnvironment:
+    def __init__(self):
+        self.state = np.zeros(8)  # Updated state to reflect new MDP (e.g., [green_priority, faulty_flag, ...])
+        self.action_space = 3  # 0: final line, 1: buffer line, 2: return faulty
+
+    def reset(self):
+        self.state = np.random.rand(8)  # Adjusted state initialization
+        return self.state
+
+    def step(self, action):
+        # Action logic and state transitions
+        green_priority, faulty_flag, buffer_occupancy, waiting_time, min_wait_time, buffer_full, anomaly_flag, production_rate = self.state
+
+        reward = 0
+        done = False
+
+        # Action logic
+        if action == 0:  # Final assembly line
+            if faulty_flag:
+                reward = -10
+            elif green_priority:
+                reward = 15
+            else:
+                reward = 5
+
+        elif action == 1:  # Move to buffer
+            if buffer_full:
+                reward = -8
+            else:
+                reward = 5 + (green_priority * 2)
+
+        elif action == 2:  # Return faulty
+            if faulty_flag:
+                reward = 10
+            else:
+                reward = -3
+
+        # Update state
+        buffer_occupancy = min(buffer_occupancy + (action == 1), 1.0)
+        waiting_time += 1
+        if waiting_time > min_wait_time:
+            reward -= 2
+
+        # Add anomaly penalty
+        if anomaly_flag:
+            reward -= 5
+
+        # Generate new state
+        self.state = np.random.rand(8)  # Reflect updated MDP dimensions
+        return self.state, reward, done
+
+# DQN Agent
+class DQNAgent:
+    def __init__(self, state_size, action_size, encoded_size, env):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = ReplayBuffer(10000)
+        self.env = env
+        self.encoder = Encoder(state_size, encoded_size)  # Encoder integration
+        self.model = DQN(encoded_size, action_size)
+        self.target_model = DQN(encoded_size, action_size)
+        self.update_target_model()
+        self.optimizer = optim.Adam(list(self.encoder.parameters()) + list(self.model.parameters()), lr=0.001)
+        self.criterion = nn.MSELoss()
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        state = torch.FloatTensor(state).unsqueeze(0)
+        encoded_state = self.encoder(state)
+        q_values = self.model(encoded_state)
+        return torch.argmax(q_values).item()
+
+    def train(self, batch_size):
+        if len(self.memory) < batch_size:
+            return None
+
+        states, actions, rewards, next_states, dones = self.memory.sample(batch_size)
+
+        states = torch.FloatTensor(states)
+        actions = torch.LongTensor(actions)
+        rewards = torch.FloatTensor(rewards)
+        next_states = torch.FloatTensor(next_states)
+        dones = torch.FloatTensor(dones)
+
+        encoded_states = self.encoder(states)
+        encoded_next_states = self.encoder(next_states)
+
+        q_values = self.model(encoded_states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        next_q_values = self.target_model(encoded_next_states).max(1)[0]
+        target_q_values = rewards + (self.gamma * next_q_values * (1 - dones))
+
+        loss = self.criterion(q_values, target_q_values.detach())
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item()
+
+
+    def save_metrics_to_csv(self, metrics, episode):
+        metrics_file = "S2_DQN_500_training_metrics.csv"
+        header = [
+            "Episode", "Total Reward", "Reward Variance", "Avg Reward per Step", "Mean Episode Length",
+            "Actor Loss", "Critic 1 Loss", "Critic 2 Loss", "Entropy Loss", "Training Time (s)", "Memory Usage (MB)"
+        ]
+
+        file_exists = os.path.isfile(metrics_file)  # Check if file exists
+
+        with open(metrics_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+        
+            # Write header only if file is empty (first time writing)
+            if not file_exists:
+                writer.writerow(header)
+    
+            # Append data for the current episode
+            writer.writerow([
+                episode + 1,
+                metrics["reward_total_per_episode"][-1],
+                metrics["reward_variance"][-1],
+                metrics["avg_reward_per_step"][-1],
+                metrics["mean_episode_lengths"][-1],
+                metrics["losses"][-1],  # Fixed key to match the stored loss
+                "N/A",  # Placeholder for Critic 1 Loss (not applicable for DQN)
+                "N/A",  # Placeholder for Critic 2 Loss (not applicable for DQN)
+                "N/A",  # Placeholder for Entropy Loss (not applicable for DQN)
+                metrics["training_times"][-1],
+                metrics["memory_usage"][-1]
+            ])
+
+# Training loop
+env = VehicleEnvironment()
+state_size = 8  # Updated state size to reflect MDP changes
+action_size = env.action_space
+encoded_size = 32  # Encoder output size
+agent = DQNAgent(state_size, action_size, encoded_size, env)
+
+num_episodes = 500
+max_steps_per_episode = 3000
+target_update_freq = 10
+batch_size = 64
+total_rewards = []
+
+# Metrics storage
+metrics = {
+    "reward_total_per_episode": [],
+    "reward_variance": [],
+    "avg_reward_per_step": [],
+    "mean_episode_lengths": [],
+    "losses": [],
+    "training_times": [],
+    "memory_usage": [],
+}
+
+for episode in range(num_episodes):
+    state = env.reset()
+    total_reward = 0
+    start_time = time.time()
+    episode_losses = []
+
+    for step in range(max_steps_per_episode):
+        action = agent.act(state)
+        next_state, reward, done = env.step(action)
+        agent.memory.add(state, action, reward, next_state, done)
+
+        state = next_state
+        total_reward += reward
+
+        loss = agent.train(batch_size)
+        if loss is not None:
+            episode_losses.append(loss)
+
+        if done:
+            break
+
+    # Update target model periodically
+    if episode % target_update_freq == 0:
+        agent.update_target_model()
+
+    # Decay epsilon
+    if agent.epsilon > agent.epsilon_min:
+        agent.epsilon *= agent.epsilon_decay
+
+    # Store episode metrics
+    metrics["reward_total_per_episode"].append(total_reward)
+    metrics["reward_variance"].append(np.var(episode_losses))
+    metrics["avg_reward_per_step"].append(np.mean(episode_losses) if episode_losses else 0)
+    metrics["mean_episode_lengths"].append(step + 1)
+    metrics["losses"].append(np.mean(episode_losses) if episode_losses else 0)
+    metrics["training_times"].append(time.time() - start_time)
+    metrics["memory_usage"].append(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024))  # Memory in MB
+    
+    # Save metrics after every episode
+    agent.save_metrics_to_csv(metrics, episode)
+
+    # Print metrics
+    print(f"Episode {episode + 1}:")
+    print(f"  Total Reward          : {total_reward:.2f}")
+    print(f"  Reward Variance       : {metrics['reward_variance'][-1]:.2f}")
+    print(f"  Avg Reward per Step   : {metrics['avg_reward_per_step'][-1]:.2f}")
+    print(f"  Episode Length        : {metrics['mean_episode_lengths'][-1]}")
+    print(f"  Loss (Mean)           : {metrics['losses'][-1]:.2f}")
+    print(f"  Training Time (s)     : {metrics['training_times'][-1]:.2f}")
+    print(f"  Memory Usage (MB)     : {metrics['memory_usage'][-1]:.2f}")
