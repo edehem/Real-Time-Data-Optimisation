@@ -1,0 +1,166 @@
+import simpy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+
+# === RNN Encoder === #
+class RNNEncoder(nn.Module):
+    def __init__(self, input_size, hidden_size, sequence_length=10):
+        super(RNNEncoder, self).__init__()
+        self.sequence_length = sequence_length  
+        self.hidden_size = hidden_size
+        self.rnn = nn.GRU(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, hidden_size)
+        self.bn = nn.BatchNorm1d(hidden_size)
+
+    def forward(self, x):
+        if x.size(1) < self.sequence_length:
+            padding = torch.zeros(x.size(0), self.sequence_length - x.size(1), x.size(2), device=x.device)
+            x = torch.cat([padding, x], dim=1)
+        elif x.size(1) > self.sequence_length:
+            x = x[:, -self.sequence_length:, :]
+        
+        _, hidden = self.rnn(x)
+        hidden = hidden.squeeze(0)
+        out = self.fc(hidden)
+        return self.bn(out)
+
+
+# === GNN Encoder === #
+class GNNEncoder(nn.Module):
+    def __init__(self, num_node_features, hidden_size):
+        super(GNNEncoder, self).__init__()
+        self.conv1 = GCNConv(num_node_features, hidden_size)
+        self.conv2 = GCNConv(hidden_size, hidden_size)
+        self.fc = nn.Linear(hidden_size, hidden_size)
+        self.bn = nn.BatchNorm1d(hidden_size)
+
+    def forward(self, x, edge_index, edge_weight=None):
+        self.sequence_length = x.size(1)  # Adjust dynamically
+        x = F.relu(self.conv1(x, edge_index, edge_weight=edge_weight))
+        x = F.relu(self.conv2(x, edge_index, edge_weight=edge_weight))
+        x = self.fc(x)
+        return self.bn(x)
+
+
+# === Buffer System with Updated Integration === #
+class BufferSystem:
+    def __init__(self, parameters, env, sequence_length=10):
+        self.env = env
+        self.parameters = parameters
+        self.num_lines = parameters['num_lines']
+        self.capacity_lines = parameters['line_capacities']
+        self.paint_station_distances = parameters['paint_station_distances']
+        self.storage_to_final_distances = parameters['storage_to_final_distances']
+        self.hidden_size = parameters['hidden_size']
+
+        # Initialize buffers
+        self.buffers = {i: simpy.Store(env, capacity=self.capacity_lines[i]) for i in range(self.num_lines)}
+        self.buffer_utilization = {i: [] for i in range(self.num_lines)}
+        self.reward = 0
+        self.time_deviation = 0
+        self.faulty_line = self.num_lines - 1
+
+        # Encoders
+        self.rnn_encoder = RNNEncoder(input_size=self.num_lines + 3, hidden_size=self.hidden_size, sequence_length=sequence_length)
+        self.gnn_encoder = GNNEncoder(num_node_features=4, hidden_size=self.hidden_size)
+
+        # Graph Structure
+        self.node_features = self.init_node_features()
+        self.edge_index = self.create_graph_edges()
+        self.edge_weights = self.create_edge_weights()
+
+    def init_node_features(self):
+        """
+        Initializes node features based on distances and placeholders for utilization and waiting times.
+        """
+        return torch.tensor([
+            [d, s, 0, 0] for d, s in zip(self.paint_station_distances, self.storage_to_final_distances)
+        ], dtype=torch.float)
+
+    def create_graph_edges(self):
+        """
+        Creates edge connections for the graph (complete graph minus self-loops).
+        """
+        edges = [(i, j) for i in range(self.num_lines) for j in range(self.num_lines) if i != j]
+        return torch.tensor(edges, dtype=torch.long).t().contiguous()
+
+    def create_edge_weights(self):
+        edge_weights = torch.tensor([
+            1.0 / (self.paint_station_distances[i] + self.storage_to_final_distances[j])
+            for i in range(self.num_lines)
+            for j in range(self.num_lines)
+        ], dtype=torch.float)
+        return F.normalize(edge_weights.view(-1), p=1, dim=0)  # Normalize weights
+
+    def update_utilization(self):
+        """
+        Updates utilization metrics for each buffer line.
+        """
+        for line, buffer in self.buffers.items():
+            utilization = len(buffer.items) / self.capacity_lines[line]
+            self.buffer_utilization[line].append(utilization)
+
+    def calculate_reward(self):
+        """
+        Computes reward based on completed cars, faulty cars, utilization, and time deviations.
+        """
+        reward_for_cars = self.parameters['completed_cars'] * 10
+        faulty_cars_penalty = len(self.buffers[self.faulty_line].items) * -5
+        utilization_bonus = sum(
+            10 * (0.7 - abs(util - 0.7))
+            for util in [sum(u) / len(u) if u else 0 for u in self.buffer_utilization.values()]
+        )
+        time_deviation_penalty = self.time_deviation * -2
+
+        reward = reward_for_cars + faulty_cars_penalty + utilization_bonus + time_deviation_penalty
+        
+        return reward
+
+    def get_state_encoding(self):
+        """
+        Encodes the current state of the system using both RNN and GNN encoders.
+        """
+        try:
+            # Update node features with utilization and waiting time
+            for i, buffer in self.buffers.items():
+                utilization = len(buffer.items) / self.capacity_lines[i]
+                avg_waiting_time = (
+                    sum(self.env.now - car['entry_time'] for car in buffer.items) / len(buffer.items)
+                    if buffer.items else 0
+                )
+                self.node_features[i, 2] = utilization
+                self.node_features[i, 3] = avg_waiting_time
+
+            # RNN encoding
+            buffer_utilization_seq = torch.tensor([
+                [len(buffer.items) / self.capacity_lines[i] for i, buffer in self.buffers.items()]
+            ] * self.rnn_encoder.sequence_length, dtype=torch.float).unsqueeze(0)
+            rnn_encoding = self.rnn_encoder(buffer_utilization_seq)
+
+            # GNN encoding
+            gnn_encoding = self.gnn_encoder(self.node_features, self.edge_index, self.edge_weights)
+
+            # Normalize and combine
+            rnn_encoding = F.normalize(rnn_encoding, p=2, dim=-1)
+            gnn_encoding = F.normalize(gnn_encoding, p=2, dim=-1)
+            
+            # Combine the RNN and GNN encodings
+            combined_encoding = torch.cat([rnn_encoding, gnn_encoding.mean(dim=0)], dim=-1)
+            return combined_encoding
+        except Exception as e:
+            print(f"Error in get_state_encoding: {e}")
+            return None
+
+    def add_to_buffer(self, car, line):
+        """
+        Adds a car to a buffer line if there is capacity and the line isn't faulty.
+        """
+        if line not in self.buffers or line == self.faulty_line:
+            return False
+        if len(self.buffers[line].items) + car['size'] > self.capacity_lines[line]:
+            return False
+        car['entry_time'] = self.env.now
+        self.buffers[line].put(car)
+        return True
