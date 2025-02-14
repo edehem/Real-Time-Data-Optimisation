@@ -1,0 +1,322 @@
+import numpy as np
+import torch
+import os
+import random
+import json
+import matplotlib.pyplot as plt
+
+# === Utility Functions === #
+
+def load_config(config_path="/Users/Edehem/Desktop/config2.json"):
+    """Loads parameters from a configuration file."""
+    with open(config_path, "r") as file:
+        return json.load(file)
+
+def get_path(base_path="./testsequences/"):
+    """Ensures the directory exists and returns the path."""
+    os.makedirs(base_path, exist_ok=True)
+    return base_path
+
+def random_variability(base, variability_ratio):
+    """Applies random variability to a base value."""
+    variability = int(base * variability_ratio)
+    return base + random.randint(-variability, variability)
+
+# === Visualization Utility === #
+
+def visualize_vehicle_distribution(test_sequences, car_types):
+    """Plots the distribution of vehicle types in the test sequences."""
+    vehicle_types = [row[0] for row in test_sequences]
+    plt.hist(vehicle_types, bins=len(car_types), align='left', rwidth=0.8)
+    plt.xticks(range(len(car_types)), car_types.values())
+    plt.title("Vehicle Type Distribution")
+    plt.xlabel("Vehicle Type")
+    plt.ylabel("Frequency")
+    plt.show()
+
+# === Capacity Control Function === #
+
+def calculate_max_vehicles(parameters):
+    """
+    Calculates the maximum number of vehicles based on storage and production capacities.
+
+    Parameters:
+        parameters (dict): Configuration values including line capacities and efficiencies.
+
+    Returns:
+        int: Maximum number of vehicles that can be produced.
+
+    Raises:
+        ValueError: If storage or line constraints are not satisfied.
+    """
+    total_storage_capacity = sum(parameters['line_capacities'])
+    total_paint_capacity = parameters['num_paint_stations'] * parameters['paint_station_efficiency']
+
+    if total_storage_capacity < 85:  # New threshold
+        raise ValueError("Storage capacity must exceed 85.")
+   
+    if parameters['num_storage_to_final_lines'] >= parameters['num_storage_lines']:
+        raise ValueError("The number of storage-to-final lines must be less than the number of storage lines.")
+
+    parameters['total_production_capacity'] = total_paint_capacity
+    return int(total_storage_capacity * 1.4)  # Produce 40% extra vehicles
+
+# === Vehicle Data Generator === #
+
+def generate_vehicle_data(parameters, kind_cars):
+    """Generates data for a single vehicle."""
+    car_type = random.randint(0, kind_cars - 1)
+    weight = parameters['vehicle_weights'][car_type]
+    size = parameters['vehicle_sizes'][car_type]
+    paint_station = random.randint(0, parameters['num_paint_stations'] - 1)
+    distance = parameters['distance_to_storage'][paint_station]
+    anomaly = int(random.random() < parameters['anomaly_probability'] * 1.2)  # Increased anomaly probability
+    green_flag = int(random.random() < parameters['green_vehicle_probability'] * 1.4)  # Increased green vehicle probability
+
+    return car_type, weight, size, paint_station, distance, anomaly, green_flag
+
+
+import numpy as np
+
+# Vehicle Production Environment
+class VehicleEnvironment:
+    def __init__(self):
+        self.state = np.zeros(8)  # Updated state to reflect new MDP (e.g., [green_priority, faulty_flag, ...])
+        self.action_space = 3  # 0: final line, 1: buffer line, 2: return faulty
+
+    def reset(self):
+        self.state = np.random.rand(8)  # Adjusted state initialization
+        return self.state
+
+    def step(self, action):
+        green_priority, faulty_flag, buffer_occupancy, waiting_time, min_wait_time, buffer_full, anomaly_flag, production_rate = self.state
+
+        reward = 0
+        done = False
+
+        # Action logic
+        if action == 0:  # Final assembly line
+            if faulty_flag:
+                reward = -10
+            elif green_priority:
+                reward = 15
+            else:
+                reward = 5
+
+        elif action == 1:  # Move to buffer
+            if buffer_full:
+                reward = -8
+            else:
+                reward = 5 + (green_priority * 2)
+
+        elif action == 2:  # Return faulty
+            if faulty_flag:
+                reward = 10
+            else:
+                reward = -3
+
+        # Update state
+        buffer_occupancy = min(buffer_occupancy + (action == 1), 1.0)
+        waiting_time += 1
+        if waiting_time > min_wait_time:
+            reward -= 2
+
+        # Add anomaly penalty
+        if anomaly_flag:
+            reward -= 5
+
+        # Generate new state
+        self.state = np.random.rand(8)  # Reflect updated MDP dimensions
+        return self.state, reward, done
+
+# === Test Sequence Generator === #
+
+def create_test_sequences(number, length, parameters, kind_cars):
+    """Creates random test sequences and saves them to a file."""
+    if not isinstance(number, int) or number <= 0:
+        raise ValueError("The 'number' parameter must be a positive integer.")
+    if not isinstance(length, int) or length <= 0:
+        raise ValueError("The 'length' parameter must be a positive integer.")
+
+    name = f'N:{number}_L:{length}_KC:{kind_cars}'
+    pathname = get_path()
+    content = os.listdir(pathname)
+    i = 1
+    new_name = name
+    while f"{new_name}.testsequence" in content:
+        new_name = f"{name}_{i}"
+        i += 1
+
+    rewards = []  # Track rewards for evaluation
+
+    with open(os.path.join(pathname, f'{new_name}.testsequence'), "w") as f:
+        f.write(f"{number} {length}\n")
+        for _ in range(number * length):
+            car_type, weight, size, paint_station, distance, anomaly, green_flag = generate_vehicle_data(parameters, kind_cars)
+            base_transfer_time = random.randint(50, 300)
+            transfer_time = random_variability(base_transfer_time, parameters['transfer_time_variability'])
+            paint_to_storage_line = random.randint(0, parameters['num_paint_to_storage_lines'] - 1)
+
+            # Vehicle routing based on defect status
+            if anomaly:
+                storage_to_final_line = parameters['first_assembly_line']  # Faulty vehicle to top line
+            else:
+                storage_to_final_line = parameters['final_assembly_line']  # Non-faulty vehicle to bottom line
+
+            neighbors = np.random.randint(0, kind_cars, size=(parameters['include_neighboring_vehicles'] * 2)).tolist()
+
+            # Simulated variables for buffer occupancy and FIFO compliance
+            buffer_occupancy = random.uniform(0, 1)  # Simulated buffer occupancy
+            fifo_compliance = random.choice([True, False])  # Simulated FIFO compliance
+
+            # Reward calculation
+            reward = 0
+            if green_flag:
+                reward += 15  # Final montaj hattına en hızlı gönderim ödülü
+            if anomaly:
+                reward -= 10  # Arızalı araç final montaja giderse ceza
+            if storage_to_final_line == parameters['final_assembly_line']:
+                reward += 7 if transfer_time < 100 else -5  # Hızlı transfer ödülü
+            if transfer_time > parameters['max_waiting_time']:
+                reward -= 10  # Maksimum bekleme süresi cezası
+            if buffer_occupancy > 0.9:
+                reward -= 5  # Tam dolu buffer cezası
+            if fifo_compliance:
+                reward += 5  # FIFO uyumluluğu ödülü
+            rewards.append(reward)
+
+            f.write(
+                f"{car_type} {weight} {size} {paint_station} {distance} {anomaly} {green_flag} {paint_to_storage_line} "
+                f"{storage_to_final_line} {transfer_time} {' '.join(map(str, neighbors))} {reward}\n"
+            )
+    print(f"Average Reward: {np.mean(rewards):.2f}")
+    return new_name
+
+    with open(os.path.join(pathname, f'{new_name}.testsequence'), "w") as f:
+        f.write(f"{number} {length}\n")
+        for _ in range(number * length):
+            car_type, weight, size, paint_station, distance, anomaly, green_flag = generate_vehicle_data(parameters, kind_cars)
+            base_transfer_time = random.randint(50, 300)
+            transfer_time = random_variability(base_transfer_time, parameters['transfer_time_variability'])
+            paint_to_storage_line = random.randint(0, parameters['num_paint_to_storage_lines'] - 1)
+
+            # Vehicle routing based on defect status
+            if anomaly:
+                storage_to_final_line = parameters['first_assembly_line']  # Faulty vehicle to top line
+            else:
+                storage_to_final_line = parameters['final_assembly_line']  # Non-faulty vehicle to bottom line
+
+            neighbors = np.random.randint(0, kind_cars, size=(parameters['include_neighboring_vehicles'] * 2)).tolist()
+
+            # Reward calculation
+            reward = 0
+            if green_flag:
+                reward += 15  # Final montaj hattına en hızlı gönderim ödülü
+            if anomaly:
+                reward -= 10  # Arızalı araç final montaja giderse ceza
+            if storage_to_final_line == parameters['final_assembly_line']:
+                reward += 7 if transfer_time < 100 else -5  # Hızlı transfer ödülü
+            if transfer_time > parameters['max_waiting_time']:
+                reward -= 10  # Maksimum bekleme süresi cezası
+            if buffer_occupancy > 0.9:
+                reward -= 5  # Tam dolu buffer cezası
+            if fifo_compliance:
+                reward += 5  # FIFO uyumluluğu ödülü
+            rewards.append(reward)
+
+            f.write(
+                f"{car_type} {weight} {size} {paint_station} {distance} {anomaly} {green_flag} {paint_to_storage_line} "
+                f"{storage_to_final_line} {transfer_time} {' '.join(map(str, neighbors))} {reward}\n"
+            )
+    print(f"Average Reward: {np.mean(rewards):.2f}")
+    return new_name
+
+# === Test Sequence Loader === #
+
+def load_test_sequences(name):
+    """Loads saved test sequences."""
+    pathname = get_path()
+    with open(os.path.join(pathname, f'{name}.testsequence'), "r") as f:
+        dim = f.readline().split()
+        rows = int(dim[0])
+        cols = int(dim[1])
+        test_sequences = [list(map(float, line.strip().split())) for line in f]
+    return torch.tensor(test_sequences).float()
+
+# === Buffer State Generator === #
+
+def create_buffer_resets(name, number, parameters):
+    """Creates random buffer states and saves them to a file."""
+    pathname = get_path()
+    res = []
+    for _ in range(number):
+        buffer_state = np.zeros((parameters['num_storage_lines'], max(parameters['line_capacities'])))
+        for line in range(parameters['num_storage_lines']):
+            num_cars = random.randint(0, parameters['line_capacities'][line])
+            if num_cars > 0:
+                buffer_state[line, :num_cars] = np.random.randint(0, KIND_CARS, num_cars)
+            # Ensure more balanced buffer utilization
+            if line > 0 and num_cars < parameters['line_capacities'][line - 1] // 2:
+                num_cars = int(parameters['line_capacities'][line - 1] * 0.75)
+                buffer_state[line, :num_cars] = np.random.randint(0, KIND_CARS, num_cars)
+        res.append(buffer_state)
+    with open(os.path.join(pathname, f'{name}.test'), "w") as f:
+        for buffer in res:
+            for line in buffer:
+                f.write(" ".join(map(str, line.astype(int))) + "\n")
+
+# === Data Conversion for MDP === #
+
+def convert_to_mdp_format(test_sequences):
+    """Converts the test sequences into a state-action format suitable for MDP."""
+    mdp_data = []
+    for sequence in test_sequences:
+        state = sequence[:5]  # Example: car_type, weight, size, paint_station, distance
+        action = sequence[5:]  # Example: anomaly, transfer times, line assignments
+        mdp_data.append((state.tolist(), action.tolist()))
+    return mdp_data
+
+# === RL Environment Interface === #
+
+def prepare_rl_environment(data, mdp_format=True):
+    """Prepares the data for integration with the RL environment."""
+    if mdp_format:
+        return convert_to_mdp_format(data)
+    return data.tolist()
+
+# === Main Execution === #
+
+if __name__ == "__main__":
+    # Load parameters from the configuration file
+    params = load_config(config_path="/Users/Edehem/Desktop/config.json")
+
+    CAR_TYPES = {0: 'CCAB', 1: 'VAN', 2: 'Standard'}
+    KIND_CARS = len(CAR_TYPES)  # Number of vehicle types
+
+    # Add parameters for final and first assembly lines
+    params['first_assembly_line'] = 0  # Top line
+    params['final_assembly_line'] = 1  # Bottom line
+
+    # Calculate max vehicles
+    max_vehicles = calculate_max_vehicles(params)
+    print(f"Calculated Max Vehicles: {max_vehicles}")
+
+    # Create test sequences
+    test_sequence_name = create_test_sequences(5, 10, params, KIND_CARS)
+    print(f"Created Test Sequence: {test_sequence_name}")
+
+    # Load test sequences
+    test_sequences = load_test_sequences(test_sequence_name)
+    print(f"Loaded Test Sequences: {test_sequences}")
+
+    # Convert to MDP format
+    mdp_data = convert_to_mdp_format(test_sequences)
+    print(f"Converted to MDP Format: {mdp_data[:3]}")  # Show first 3 entries
+
+    # Interface with RL environment
+    rl_ready_data = prepare_rl_environment(test_sequences)
+    print(f"RL Ready Data: {rl_ready_data[:3]}")  # Show first 3 entries
+
+    # Create buffer resets
+    create_buffer_resets("buffer_test", 3, params)
+    print("Buffer resets created.")
