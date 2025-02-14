@@ -1,0 +1,177 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import time
+import psutil
+import os
+import csv
+from collections import deque
+
+
+# DQN Network with Continuous Actions
+class DQNContinuous(nn.Module):
+    def __init__(self, input_dim, action_dim):
+        super(DQNContinuous, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.mu = nn.Linear(128, action_dim)
+        self.sigma = nn.Linear(128, action_dim)
+    
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        mu = torch.tanh(self.mu(x))
+        sigma = torch.nn.functional.softplus(self.sigma(x)) + 1e-5
+        return mu, sigma
+
+# MCTS_DQN_Agent with Continuous Actions
+class MCTS_DQN_Agent:
+    def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=5000)
+        self.gamma = 0.99  # Discount factor
+        self.epsilon = 1.0  # Exploration rate
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.learning_rate = 0.001
+        self.model = DQNContinuous(state_size, action_size)
+        self.target_model = DQNContinuous(state_size, action_size)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.criterion = nn.MSELoss()
+        self.update_target_model()
+
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+    
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state):
+        state = torch.FloatTensor(state).unsqueeze(0)
+        mu, sigma = self.model(state)
+        action = torch.normal(mu, sigma).detach().numpy()
+        return np.clip(action, -1, 1)
+    
+    def replay(self, batch_size=64):
+        if len(self.memory) < batch_size:
+            return
+        minibatch = random.sample(self.memory, batch_size)
+        for state, action, reward, next_state, done in minibatch:
+            target = reward
+            if not done:
+                with torch.no_grad():
+                    mu, _ = self.target_model(torch.FloatTensor(next_state).unsqueeze(0))
+                    target = reward + self.gamma * mu.item()
+            self.optimizer.zero_grad()
+            mu, _ = self.model(torch.FloatTensor(state).unsqueeze(0))
+            loss = self.criterion(mu, torch.tensor(action, dtype=torch.float32))
+            loss.backward()
+            self.optimizer.step()
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def save_metrics_to_csv(self, metrics, episode):
+        metrics_file = "S2_MCTS_DQN_200_contsetup_training_metrics.csv"
+        header = [
+            "Episode", "Total Reward", "Reward Variance", "Avg Reward per Step", "Mean Episode Length",
+            "Training Time (s)", "Memory Usage (MB)"
+        ]
+
+        file_exists = os.path.isfile(metrics_file)
+
+        with open(metrics_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow([
+                episode + 1,
+                metrics["reward_total_per_episode"][-1],
+                metrics["reward_variance"][-1],
+                metrics["avg_reward_per_step"][-1],
+                metrics["mean_episode_lengths"][-1],
+                metrics["training_times"][-1],
+                metrics["memory_usage"][-1]
+            ])
+
+# Vehicle Environment Simulation
+class VehicleEnvironment:
+    def __init__(self):
+        self.state = np.zeros(8)
+        self.action_space = 1  # Continuous Action
+    
+    def reset(self):
+        self.state = np.random.rand(8)
+        return self.state
+
+    def step(self, action):
+        reward = np.random.rand() * 10 - 5
+        done = np.random.rand() > 0.95
+        self.state = np.random.rand(8)
+        return self.state, reward, done
+
+# Training Loop
+env = VehicleEnvironment()
+state_size = 8
+max_steps_per_episode = 1000 
+action_size = env.action_space
+agent = MCTS_DQN_Agent(state_size, action_size)
+
+num_episodes = 200
+batch_size = 64
+target_update_freq = 10
+
+# Metrics storage
+metrics = {
+    "reward_total_per_episode": [],
+    "reward_variance": [],
+    "avg_reward_per_step": [],
+    "mean_episode_lengths": [],
+    "training_times": [],
+    "memory_usage": [],
+}
+
+for episode in range(num_episodes):
+    state = env.reset()
+    total_reward = 0
+    rewards_per_step = []
+    start_time = time.time()
+    episode_steps = 0
+
+    for step in range(max_steps_per_episode):
+        action = agent.act(state)
+        next_state, reward, done = env.step(action)
+        agent.remember(state, action, reward, next_state, done)
+        state = next_state
+        rewards_per_step.append(reward)
+        total_reward += reward
+        episode_steps += 1
+        agent.replay(batch_size)
+        if done:
+            break
+    
+    # Episode metrics
+    metrics["reward_total_per_episode"].append(total_reward)
+    metrics["reward_variance"].append(np.var(rewards_per_step))
+    metrics["avg_reward_per_step"].append(np.mean(rewards_per_step))
+    metrics["mean_episode_lengths"].append(episode_steps)
+    metrics["training_times"].append(time.time() - start_time)
+    metrics["memory_usage"].append(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024))  # Memory in MB
+    
+    # Save metrics after every episode
+    agent.save_metrics_to_csv(metrics, episode)
+    
+    # Update target model periodically
+    if episode % target_update_freq == 0:
+        agent.update_target_model()
+
+    # Print metrics
+    print(f"Episode {episode + 1}:")
+    print(f"  Total Reward          : {total_reward:.2f}")
+    print(f"  Reward Variance       : {metrics['reward_variance'][-1]:.2f}")
+    print(f"  Avg Reward per Step   : {metrics['avg_reward_per_step'][-1]:.2f}")
+    print(f"  Episode Length        : {episode_steps}")
+    print(f"  Training Time (s)     : {metrics['training_times'][-1]:.2f}")
+    print(f"  Memory Usage (MB)     : {metrics['memory_usage'][-1]:.2f}")
