@@ -1,0 +1,108 @@
+import simpy
+import numpy as np
+
+class BufferEnvironment:
+    def __init__(self, buffer_lines=12, buffer_capacity=10):
+        self.env = simpy.Environment()
+        self.buffer_lines = buffer_lines
+        self.buffer_capacity = buffer_capacity
+        self.buffer = {i: [] for i in range(buffer_lines)}  # Each buffer line holds vehicles
+        self.state = self.get_state()
+
+    def reset(self):
+        self.buffer = {i: [] for i in range(self.buffer_lines)}
+        self.state = self.get_state()
+        return self.state
+
+    def get_state(self):
+        # Represent state as a dictionary of buffer line occupancies and vehicle statuses
+        return {line: [(v["type"], v["waiting_time"]) for v in vehicles] for line, vehicles in self.buffer.items()}
+
+    def step(self, action):
+        """
+        Actions are dictionaries with the following keys:
+        - "action_type": "place", "send_green", "send_faulty", "move_within_buffer", "send_other"
+        - "buffer_line": Index of the buffer line to act on (if applicable)
+        
+        Action types:
+        - "place": Places a vehicle in the specified buffer line.
+        - "send_green": Sends green vehicles to final assembly via the bottom line of the left vertical line.
+        - "send_faulty": Sends faulty vehicles to the first assembly via the top line of the left vertical line.
+        - "move_within_buffer": Redistributes vehicles to clear green and faulty vehicles.
+        - "send_other": Sends other vehicles (not green or faulty) that have completed their minimum waiting time.
+        """
+        action_type = action.get("action_type")
+        buffer_line = action.get("buffer_line")
+        reward = 0
+        done = False
+
+        if action_type == "place":
+            if len(self.buffer[buffer_line]) < self.buffer_capacity:
+                # Add a new vehicle to the buffer line
+                vehicle = {
+                    "type": np.random.choice(["green", "faulty", "other"], p=[0.3, 0.2, 0.5]),
+                    "waiting_time": 0
+                }
+                self.buffer[buffer_line].append(vehicle)
+                reward += 1  # Reward for successfully placing a vehicle
+            else:
+                reward -= 5  # Penalty for attempting to place a vehicle in a full line
+
+        elif action_type == "send_green":
+            for line, vehicles in self.buffer.items():
+                self.buffer[line] = [v for v in vehicles if v["type"] != "green"]
+            reward += 10  # Reward for clearing green vehicles
+
+        elif action_type == "send_faulty":
+            for line, vehicles in self.buffer.items():
+                self.buffer[line] = [v for v in vehicles if v["type"] != "faulty"]
+            reward += 8  # Reward for clearing faulty vehicles
+
+        elif action_type == "move_within_buffer":
+            for line, vehicles in self.buffer.items():
+                # Redistribute vehicles to other lines to make space
+                for vehicle in vehicles:
+                    target_line = np.random.choice(range(self.buffer_lines))
+                    if len(self.buffer[target_line]) < self.buffer_capacity:
+                        self.buffer[target_line].append(vehicle)
+                        self.buffer[line].remove(vehicle)
+                        reward += 2  # Reward for optimizing buffer space
+
+        elif action_type == "send_other":
+            for line, vehicles in self.buffer.items():
+                self.buffer[line] = [v for v in vehicles if not (v["type"] == "other" and v["waiting_time"] >= 5)]
+            reward += 5  # Reward for sending other vehicles that completed minimum waiting time
+
+        # Update waiting times for all vehicles
+        for line, vehicles in self.buffer.items():
+            for vehicle in vehicles:
+                vehicle["waiting_time"] += 1
+
+        # Update state and check if done
+        self.state = self.get_state()
+        if all(len(vehicles) == 0 for vehicles in self.buffer.values()):
+            done = True  # Simulation ends when all buffer lines are empty
+
+        return self.state, reward, done
+
+# Example usage
+env = BufferEnvironment(buffer_lines=12, buffer_capacity=10)
+state = env.reset()
+
+# Example actions
+actions = [
+    {"action_type": "place", "buffer_line": 0},
+    {"action_type": "send_green"},
+    {"action_type": "send_faulty"},
+    {"action_type": "move_within_buffer"},
+    {"action_type": "send_other"}
+]
+
+for action in actions:
+    state, reward, done = env.step(action)
+    print("State:", state)
+    print("Reward:", reward)
+    print("Done:", done)
+    if done:
+        break
+
