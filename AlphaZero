@@ -1,0 +1,197 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import time
+import csv
+import psutil
+import os
+from collections import deque
+
+# AlphaGo Zero-inspired Neural Network
+class AlphaGoZeroNN(nn.Module):
+    def __init__(self, input_dim, action_size):
+        super(AlphaGoZeroNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.policy_head = nn.Linear(128, action_size)
+        self.value_head = nn.Linear(128, 1)
+    
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        policy = torch.softmax(self.policy_head(x), dim=-1)
+        value = torch.tanh(self.value_head(x))
+        return policy, value
+
+# Monte Carlo Tree Node
+class MCTSNode:
+    def __init__(self, state, parent=None):
+        self.state = state
+        self.parent = parent
+        self.children = {}
+        self.visit_count = 0
+        self.value_sum = 0.0
+        self.priors = None  # Stores policy probabilities
+
+    def expand(self, action_priors):
+        self.priors = action_priors
+        for action, prob in enumerate(action_priors):
+            if action not in self.children:
+                self.children[action] = MCTSNode(self.state, parent=self)
+
+    def select(self, c_puct=1.0):
+        best_action = max(self.children, key=lambda a: self._ucb(a, c_puct))
+        return best_action, self.children[best_action]
+
+    def _ucb(self, action, c_puct):
+        q_value = self.children[action].value_sum / (1 + self.children[action].visit_count)
+        u_value = c_puct * self.priors[action] * (np.sqrt(self.visit_count + 1) / (1 + self.children[action].visit_count))
+        return q_value + u_value
+
+    def update(self, value):
+        self.visit_count += 1
+        self.value_sum += value
+
+# MCTS Agent with AlphaGo Zero Policy & Value Network
+import csv
+import os
+
+class MCTSAlphaGoAgent:
+    def __init__(self, state_size, action_size, simulations=50):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.simulations = simulations
+        self.model = AlphaGoZeroNN(state_size, action_size)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.MSELoss()
+    
+    def search(self, state):
+        root = MCTSNode(state)
+        for _ in range(self.simulations):
+            node = root
+            while node.children:
+                action, node = node.select()
+            policy, value = self.predict(state)
+            node.expand(policy.detach().numpy())
+            self.backpropagate(node, value.item())
+        best_action = max(root.children, key=lambda a: root.children[a].visit_count)
+        return best_action
+    
+    def predict(self, state):
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        return self.model(state_tensor)
+    
+    def backpropagate(self, node, value):
+        while node:
+            node.update(value)
+            node = node.parent
+    
+    def save_metrics_to_csv(self, metrics, episode):
+        metrics_file = "S2_Alpha_ZERO_training_metrics_nostep_500.csv"
+        header = [
+            "Episode", "Total Reward", "Reward Variance", "Avg Reward per Step", "Mean Episode Length",
+            "Training Time (s)", "Memory Usage (MB)"
+        ]
+
+        file_exists = os.path.isfile(metrics_file)
+
+        with open(metrics_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow([
+                episode + 1,
+                metrics["reward_total_per_episode"][-1],
+                metrics["reward_variance"][-1],
+                metrics["avg_reward_per_step"][-1],
+                metrics["mean_episode_lengths"][-1],
+                metrics["training_times"][-1],
+                metrics["memory_usage"][-1]
+            ])
+
+
+# Vehicle Environment Simulation
+class VehicleEnvironment:
+    def __init__(self):
+        self.state = np.zeros(8)
+        self.action_space = 3
+    
+    def reset(self):
+        self.state = np.random.rand(8)
+        return self.state
+
+    def step(self, action):
+        reward = np.random.uniform(-10, 10)
+        next_state = np.random.rand(8)
+        done = np.random.rand() < 0.1
+        return next_state, reward, done
+
+    
+env = VehicleEnvironment()
+state_size = 8
+action_size = env.action_space
+agent = MCTSAlphaGoAgent(state_size, action_size)
+
+num_episodes = 500
+batch_size = 64
+target_update_freq = 10
+
+metrics = {
+    "reward_total_per_episode": [],
+    "reward_variance": [],
+    "avg_reward_per_step": [],
+    "mean_episode_lengths": [],
+    "training_times": [],
+    "memory_usage": [],
+}
+
+# Remove the max_steps_per_episode and allow episodes to continue until termination.
+max_steps_per_episode = None  # No fixed limit on steps per episode
+
+# In the training loop:
+for episode in range(num_episodes):
+    state = env.reset()
+    total_reward = 0
+    rewards_per_step = []
+    start_time = time.time()
+    episode_steps = 0
+
+    while True:  # Continue until the episode ends
+        action = agent.search(state)
+        next_state, reward, done = env.step(action)
+        total_reward += reward
+        state = next_state
+        rewards_per_step.append(reward)
+        episode_steps += 1
+        if done:
+            break  # End the episode when 'done' is True
+    
+    # Store the episode metrics
+    metrics["reward_total_per_episode"].append(total_reward)
+    metrics["reward_variance"].append(np.var(rewards_per_step))
+    metrics["avg_reward_per_step"].append(np.mean(rewards_per_step))
+    metrics["mean_episode_lengths"].append(episode_steps)
+    metrics["training_times"].append(time.time() - start_time)
+    metrics["memory_usage"].append(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024))
+    
+    # Save metrics for each episode
+    agent.save_metrics_to_csv(metrics, episode)
+    
+    # Optionally print or log the progress for each episode
+    print(f"Episode {episode + 1}:")
+    print(f"  Total Reward          : {total_reward:.2f}")
+    print(f"  Reward Variance       : {metrics['reward_variance'][-1]:.2f}")
+    print(f"  Avg Reward per Step   : {metrics['avg_reward_per_step'][-1]:.2f}")
+    print(f"  Episode Length        : {episode_steps}")
+    print(f"  Training Time (s)     : {metrics['training_times'][-1]:.2f}")
+    print(f"  Memory Usage (MB)     : {metrics['memory_usage'][-1]:.2f}")
+
+    # Optionally compute and print moving averages over 10 episodes
+    if episode >= 9:  # Ensure we have at least 10 episodes to compute the moving average
+        metrics["reward_total_per_episode"][-1] = np.mean(metrics["reward_total_per_episode"][-10:])
+        metrics["reward_variance"][-1] = np.mean(metrics["reward_variance"][-10:])
+        metrics["avg_reward_per_step"][-1] = np.mean(metrics["avg_reward_per_step"][-10:])
+        metrics["mean_episode_lengths"][-1] = np.mean(metrics["mean_episode_lengths"][-10:])
+        metrics["training_times"][-1] = np.mean(metrics["training_times"][-10:])
+        metrics["memory_usage"][-1] = np.mean(metrics["memory_usage"][-10:])
